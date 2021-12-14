@@ -11,6 +11,9 @@
 from snakemake.remote.S3 import RemoteProvider as S3RemoteProvider
 S3 = S3RemoteProvider()
 
+## Local rules
+localrules: step1c
+
 #envvars:
 #    "TEST_ENVVAR1",
 #    "TEST_ENVVAR2"
@@ -67,6 +70,26 @@ rule step1b:
         """
         echo "abcdefg" > message2
         cat snakemake-tibanna-test/1/somefile2 >> message2
+        """
+
+rule step1c:
+    conda:
+        "env.yml"
+    input:
+        S3.remote("snakemake-tibanna-test/1/somefile2")
+    output:
+        message = "message3"
+    log:
+        "log.txt"
+    benchmark:
+        "benchmark.txt"
+    threads: 1
+    resources:
+        mem_mb=1024
+    shell:
+        """
+        echo "abcdefg" > message3
+        cat snakemake-tibanna-test/1/somefile2 >> message3
         """
 
 rule step2:
