@@ -15,9 +15,6 @@
 
 import sys
 import os
-from recommonmark.parser import CommonMarkParser
-
-source_parsers = {'.md': CommonMarkParser}
 
 
 # If extensions (or modules to document with autodoc) are in another directory,
@@ -37,9 +34,17 @@ extensions = [
     'sphinx.ext.autodoc',
     'sphinx.ext.mathjax',
     'sphinx.ext.viewcode',
-    'sphinxcontrib.napoleon',
-    'sphinxarg.ext'
+    'sphinx.ext.napoleon',
+    'sphinxarg.ext',
+    'sphinx.ext.autosectionlabel',
+    'myst_parser',
 ]
+
+# skip internal class that Sphinx can't process (#296)
+autodoc_default_options = {'exclude-members': 'lazy_property'}
+
+# Snakemake theme (made by SciAni).
+html_css_files = ["theme.css"]
 
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']
@@ -55,7 +60,7 @@ master_doc = 'index'
 
 # General information about the project.
 project = 'Snakemake'
-copyright = '2014-2016, Johannes Koester'
+copyright = '2014-2021, Johannes Koester'
 
 import snakemake
 # The version info for the project you're documenting, acts as replacement for
@@ -150,7 +155,7 @@ html_static_path = ['_static']
 # Add any extra paths that contain custom files (such as robots.txt or
 # .htaccess) here, relative to this directory. These files are copied
 # directly to the root of the documentation.
-#html_extra_path = []
+#html_extra_path = ["_static/css"]
 
 # If not '', a 'Last updated on:' timestamp is inserted at every page bottom,
 # using the given strftime format.
@@ -165,7 +170,7 @@ html_static_path = ['_static']
 
 # Additional templates that should be rendered to pages, maps page names to
 # template names.
-#html_additional_pages = {}
+#html_additional_pages = {"index": "index.html"}
 
 # If false, no module index is generated.
 #html_domain_indices = True
@@ -276,4 +281,4 @@ texinfo_documents = [
 #texinfo_no_detailmenu = False
 
 def setup(app):
-    app.add_stylesheet('sphinx-argparse.css')
+    app.add_css_file('sphinx-argparse.css')

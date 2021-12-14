@@ -6,32 +6,32 @@ Additional features
 .. _Snakemake: https://snakemake.readthedocs.io
 .. _Snakemake homepage: https://snakemake.readthedocs.io
 .. _GNU Make: https://www.gnu.org/software/make
-.. _Python: http://www.python.org
+.. _Python: https://www.python.org
 .. _BWA: http://bio-bwa.sourceforge.net
-.. _SAMtools: http://www.htslib.org
-.. _BCFtools: http://www.htslib.org
-.. _Pandas: http://pandas.pydata.org
-.. _Miniconda: http://conda.pydata.org/miniconda.html
-.. _Conda: http://conda.pydata.org
-.. _Bash: http://www.tldp.org/LDP/Bash-Beginners-Guide/html
+.. _SAMtools: https://www.htslib.org
+.. _BCFtools: https://www.htslib.org
+.. _Pandas: https://pandas.pydata.org
+.. _Miniconda: https://conda.pydata.org/miniconda.html
+.. _Conda: https://conda.pydata.org
+.. _Bash: https://www.tldp.org/LDP/Bash-Beginners-Guide/html
 .. _Atom: https://atom.io
 .. _Anaconda: https://anaconda.org
-.. _Graphviz: http://www.graphviz.org
-.. _RestructuredText: http://docutils.sourceforge.net/rst.html
+.. _Graphviz: https://www.graphviz.org
+.. _RestructuredText: https://docutils.sourceforge.io/docs/user/rst/quickstart.html
 .. _data URI: https://developer.mozilla.org/en-US/docs/Web/HTTP/data_URIs
-.. _JSON: http://json.org
-.. _YAML: http://yaml.org
-.. _DRMAA: http://www.drmaa.org
-.. _rpy2: http://rpy.sourceforge.net
+.. _JSON: https://json.org
+.. _YAML: https://yaml.org
+.. _DRMAA: https://www.drmaa.org
+.. _rpy2: https://rpy2.github.io
 .. _R: https://www.r-project.org
 .. _Rscript: https://stat.ethz.ch/R-manual/R-devel/library/utils/html/Rscript.html
-.. _PyYAML: http://pyyaml.org
-.. _Docutils: http://docutils.sourceforge.net
+.. _PyYAML: https://pyyaml.org
+.. _Docutils: https://docutils.sourceforge.io
 .. _Bioconda: https://bioconda.github.io
 .. _Vagrant: https://www.vagrantup.com
 .. _Vagrant Documentation: https://docs.vagrantup.com
-.. _Blogpost: http://blog.osteel.me/posts/2015/01/25/how-to-use-vagrant-on-windows.html
-.. _slides: http://slides.com/johanneskoester/deck-1
+.. _Blogpost: https://blog.osteel.me/posts/2015/01/25/how-to-use-vagrant-on-windows.html
+.. _slides: https://slides.com/johanneskoester/deck-1
 
 In the following, we introduce some features that are beyond the scope of above example workflow.
 For details and even more features, see :ref:`user_manual-writing_snakefiles`, :ref:`project_info-faq` and the command line help (``snakemake --help``).
@@ -128,6 +128,7 @@ with ``envs/samtools.yaml`` defined as
 
   channels:
     - bioconda
+    - conda-forge
   dependencies:
     - samtools =1.9
 
@@ -140,11 +141,11 @@ When Snakemake is executed with
 
 .. code:: console
 
-  snakemake --use-conda
+  snakemake --use-conda --cores 1
 
 it will automatically create required environments and
 activate them before a job is executed.
-It is best practice to specify at least the `major and minor version <http://semver.org/>`_ of any packages
+It is best practice to specify at least the `major and minor version <https://semver.org/>`_ of any packages
 in the environment definition. Specifying environments per rule in this way has two
 advantages.
 First, the workflow definition also documents all used software versions.
@@ -240,9 +241,9 @@ Using --cluster-status
 ::::::::::::::::::::::
 
 Sometimes you need specific detection to determine if a cluster job completed successfully, failed or is still running.
-Error detection with ``--cluster`` can be improved for edge cases such as timeouts and jobs exceeding memory that are silently terminated by 
+Error detection with ``--cluster`` can be improved for edge cases such as timeouts and jobs exceeding memory that are silently terminated by
 the queueing system.
-This can be achieved with the ``--cluster-status`` option. This takes as input a script and passes a job id as first argument.
+This can be achieved with the ``--cluster-status`` option. The value of this option should be a executable script which takes a job id as the first argument and prints to stdout only one of [running|success|failed]. Importantly, the job id snakemake passes on is captured from the stdout of the cluster submit tool. This string will often include more than the job id, but snakemake does not modify this string and will pass this string to the status script unchanged. In the situation where snakemake has received more than the job id these are 3 potential solutions to consider: parse the string received by the script and extract the job id within the script, wrap the submission tool to intercept its stdout and return just the job code, or ideally, the cluster may offer an option to only return the job id upon submission and you can instruct snakemake to use that option. For sge this would look like  ``snakemake --cluster "qsub -terse"``.
 
 The following (simplified) script detects the job status on a given SLURM cluster (>= 14.03.0rc1 is required for ``--parsable``).
 
@@ -268,7 +269,7 @@ To use this script call snakemake similar to below, where ``status.py`` is the s
 
 .. code:: console
 
-    $ snakemake all --cluster "sbatch --cpus-per-task=1 --parsable" --cluster-status ./status.py
+    $ snakemake all --jobs 100 --cluster "sbatch --cpus-per-task=1 --parsable" --cluster-status ./status.py
 
 
 Constraining wildcards
