@@ -15,7 +15,7 @@ The Versioneer
 (https://pypip.in/version/versioneer/badge.svg?style=flat)
 ](https://pypi.python.org/pypi/versioneer/)
 * [![Build Status]
-(https://travis-ci.org/warner/python-versioneer.png?branch=master)
+(https://travis-ci.org/warner/python-versioneer.png?branch=main)
 ](https://travis-ci.org/warner/python-versioneer)
 
 This is a tool for managing a recorded version number in distutils-based
@@ -1752,7 +1752,7 @@ def do_setup():
     except EnvironmentError:
         pass
     # That doesn't cover everything MANIFEST.in can do
-    # (http://docs.python.org/2/distutils/sourcedist.html#commands), so
+    # (https://docs.python.org/2/distutils/sourcedist.html#commands), so
     # it might give some false negatives. Appending redundant 'include'
     # lines is safe, though.
     if "versioneer.py" not in simple_includes:

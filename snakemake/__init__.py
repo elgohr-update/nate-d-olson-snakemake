@@ -1,12 +1,12 @@
 __author__ = "Johannes Köster"
-__copyright__ = "Copyright 2015-2019, Johannes Köster"
-__email__ = "koester@jimmy.harvard.edu"
+__copyright__ = "Copyright 2021, Johannes Köster"
+__email__ = "johannes.koester@uni-due.de"
 __license__ = "MIT"
 
 import os
 import subprocess
 import glob
-from argparse import ArgumentError
+from argparse import ArgumentError, ArgumentDefaultsHelpFormatter
 import logging as _logging
 import re
 import sys
@@ -16,16 +16,17 @@ import webbrowser
 from functools import partial
 import importlib
 import shutil
+import shlex
 from importlib.machinery import SourceFileLoader
 
 from snakemake.workflow import Workflow
 from snakemake.dag import Batch
 from snakemake.exceptions import print_exception, WorkflowError
-from snakemake.logging import setup_logger, logger, SlackLogger
-from snakemake.io import load_configfile
+from snakemake.logging import setup_logger, logger, SlackLogger, WMSLogger
+from snakemake.io import load_configfile, wait_for_files
 from snakemake.shell import shell
 from snakemake.utils import update_config, available_cpu_count
-from snakemake.common import Mode, __version__
+from snakemake.common import Mode, __version__, MIN_PY_VERSION, get_appdirs
 from snakemake.resources import parse_resources, DefaultResources
 
 
@@ -42,14 +43,21 @@ def snakemake(
     batch=None,
     cache=None,
     report=None,
+    report_stylesheet=None,
+    containerize=False,
+    lint=None,
+    generate_unit_tests=None,
     listrules=False,
     list_target_rules=False,
     cores=1,
-    nodes=1,
+    nodes=None,
     local_cores=1,
+    max_threads=None,
     resources=dict(),
-    overwrite_threads=dict(),
+    overwrite_threads=None,
+    overwrite_scatter=None,
     default_resources=None,
+    overwrite_resources=None,
     config=dict(),
     configfiles=None,
     config_args=None,
@@ -87,7 +95,7 @@ def snakemake(
     lock=True,
     unlock=False,
     cleanup_metadata=None,
-    cleanup_conda=False,
+    conda_cleanup_envs=False,
     cleanup_shadow=False,
     cleanup_scripts=True,
     force_incomplete=False,
@@ -108,6 +116,7 @@ def snakemake(
     print_compilation=False,
     debug=False,
     notemp=False,
+    all_temp=False,
     keep_remote_local=False,
     nodeps=False,
     keep_target_files=False,
@@ -129,27 +138,48 @@ def snakemake(
     use_singularity=False,
     use_env_modules=False,
     singularity_args="",
+    conda_frontend="conda",
     conda_prefix=None,
+    conda_cleanup_pkgs=None,
     list_conda_envs=False,
     singularity_prefix=None,
     shadow_prefix=None,
-    create_envs_only=False,
+    scheduler="ilp",
+    scheduler_ilp_solver=None,
+    conda_create_envs_only=False,
     mode=Mode.default,
     wrapper_prefix=None,
     kubernetes=None,
-    kubernetes_envvars=None,
     container_image=None,
     tibanna=False,
     tibanna_sfn=None,
+    google_lifesciences=False,
+    google_lifesciences_regions=None,
+    google_lifesciences_location=None,
+    google_lifesciences_cache=False,
+    tes=None,
+    preemption_default=None,
+    preemptible_rules=None,
     precommand="",
     default_remote_provider=None,
     default_remote_prefix="",
+    tibanna_config=False,
     assume_shared_fs=True,
     cluster_status=None,
     export_cwl=None,
     show_failed_logs=False,
     keep_incomplete=False,
+    keep_metadata=True,
     messaging=None,
+    edit_notebook=None,
+    envvars=None,
+    overwrite_groups=None,
+    group_components=None,
+    max_inventory_wait_time=20,
+    execute_subworkflows=True,
+    conda_not_block_search_path_envvars=False,
+    scheduler_solver_path=None,
+    conda_base_path=None,
 ):
     """Run snakemake on a given snakefile.
 
@@ -159,6 +189,7 @@ def snakemake(
         snakefile (str):            the path to the snakefile
         batch (Batch):              whether to compute only a partial DAG, defined by the given Batch object (default None)
         report (str):               create an HTML report for a previous run at the given path
+        lint (str):                 print lints instead of executing (None, "plain" or "json", default None)
         listrules (bool):           list rules (default False)
         list_target_rules (bool):   list target rules (default False)
         cores (int):                the number of provided cores (ignored when using cluster support) (default 1)
@@ -174,6 +205,7 @@ def snakemake(
         forcetargets (bool):        force given targets to be re-created (default False)
         forceall (bool):            force all output files to be re-created (default False)
         forcerun (list):            list of files and rules that shall be re-created/re-executed (default [])
+        execute_subworkflows (bool):   execute subworkflows if present (default True)
         prioritytargets (list):     list of targets that shall be run with maximum priority (default [])
         stats (str):                path to file that shall contain stats about the workflow execution (default None)
         printreason (bool):         print the reason for the execution of each job (default false)
@@ -198,7 +230,8 @@ def snakemake(
         lock (bool):                lock the working directory when executing the workflow (default True)
         unlock (bool):              just unlock the working directory (default False)
         cleanup_metadata (list):    just cleanup metadata of given list of output files (default None)
-        cleanup_conda (bool):       just cleanup unused conda environments (default False)
+        drop_metadata (bool):       drop metadata file tracking information after job finishes (--report and --list_x_changes information will be incomplete) (default False)
+        conda_cleanup_envs (bool):  just cleanup unused conda environments (default False)
         cleanup_shadow (bool):      just cleanup old shadow directories (default False)
         cleanup_scripts (bool):     delete wrapper scripts used for execution (default True)
         force_incomplete (bool):    force the re-creation of incomplete files (default False)
@@ -210,8 +243,8 @@ def snakemake(
         list_untracked (bool):      list files in the workdir that are not used in the workflow (default False)
         summary (bool):             list summary of all output files and their status (default False)
         archive (str):              archive workflow into the given tarball
-        delete_all_output (bool)    remove all files generated by the workflow (default False)
-        delete_temp_output (bool)   remove all temporary files generated by the workflow (default False)
+        delete_all_output (bool):    remove all files generated by the workflow (default False)
+        delete_temp_output (bool):   remove all temporary files generated by the workflow (default False)
         latency_wait (int):         how many seconds to wait for an output file to appear after the execution of a job, e.g. to handle filesystem latency (default 3)
         wait_for_files (list):      wait for given files to be present before executing the workflow
         list_resources (bool):      list resources used in the workflow (default False)
@@ -238,25 +271,42 @@ def snakemake(
         use_env_modules (bool):     load environment modules if defined in rules
         singularity_args (str):     additional arguments to pass to singularity
         conda_prefix (str):         the directory in which conda environments will be created (default None)
+        conda_cleanup_pkgs (snakemake.deployment.conda.CondaCleanupMode):
+                                    whether to clean up conda tarballs after env creation (default None), valid values: "tarballs", "cache"
         singularity_prefix (str):   the directory to which singularity images will be pulled (default None)
         shadow_prefix (str):        prefix for shadow directories. The job-specific shadow directories will be created in $SHADOW_PREFIX/shadow/ (default None)
-        create_envs_only (bool):    if specified, only builds the conda environments specified for each job, then exits.
+        conda_create_envs_only (bool):    if specified, only builds the conda environments specified for each job, then exits.
         list_conda_envs (bool):     list conda environments and their location on disk.
         mode (snakemake.common.Mode): execution mode
         wrapper_prefix (str):       prefix for wrapper script URLs (default None)
         kubernetes (str):           submit jobs to kubernetes, using the given namespace.
-        kubernetes_envvars (list):  environment variables that shall be passed to kubernetes jobs.
         container_image (str):      Docker image to use, e.g., for kubernetes.
         default_remote_provider (str): default remote provider to use instead of local files (e.g. S3, GS)
         default_remote_prefix (str): prefix for default remote provider (e.g. name of the bucket).
-        tibanna (str):              submit jobs to AWS cloud using Tibanna.
+        tibanna (bool):             submit jobs to AWS cloud using Tibanna.
         tibanna_sfn (str):          Step function (Unicorn) name of Tibanna (e.g. tibanna_unicorn_monty). This must be deployed first using tibanna cli.
+        google_lifesciences (bool): submit jobs to Google Cloud Life Sciences (pipelines API).
+        google_lifesciences_regions (list): a list of regions (e.g., us-east1)
+        google_lifesciences_location (str): Life Sciences API location (e.g., us-central1)
+        google_lifesciences_cache (bool): save a cache of the compressed working directories in Google Cloud Storage for later usage.
+        tes (str):                  Execute workflow tasks on GA4GH TES server given by url.
         precommand (str):           commands to run on AWS cloud before the snakemake command (e.g. wget, git clone, unzip, etc). Use with --tibanna.
+        preemption_default (int):   set a default number of preemptible instance retries (for Google Life Sciences executor only)
+        preemptible_rules (list):    define custom preemptible instance retries for specific rules (for Google Life Sciences executor only)
+        tibanna_config (list):      Additional tibanna config e.g. --tibanna-config spot_instance=true subnet=<subnet_id> security group=<security_group_id>
         assume_shared_fs (bool):    assume that cluster nodes share a common filesystem (default true).
         cluster_status (str):       status command for cluster execution. If None, Snakemake will rely on flag files. Otherwise, it expects the command to return "success", "failure" or "running" when executing with a cluster jobid as single argument.
         export_cwl (str):           Compile workflow to CWL and save to given file
         log_handler (function):     redirect snakemake output to this custom log handler, a function that takes a log message dictionary (see below) as its only argument (default None). The log message dictionary for the log handler has to following entries:
-        keep_incomplete (bool):      keep incomplete output files of failed jobs
+        keep_incomplete (bool):     keep incomplete output files of failed jobs
+        edit_notebook (object):     "notebook.EditMode" object to configuring notebook server for interactive editing of a rule notebook. If None, do not edit.
+        scheduler (str):            Select scheduling algorithm (default ilp)
+        scheduler_ilp_solver (str): Set solver for ilp scheduler.
+        overwrite_groups (dict):    Rule to group assignments (default None)
+        group_components (dict):    Number of connected components given groups shall span before being split up (1 by default if empty)
+        conda_not_block_search_path_envvars (bool): Do not block search path envvars (R_LIBS, PYTHONPATH, ...) when using conda environments.
+        scheduler_solver_path (str): Path to Snakemake environment (this can be used to e.g. overwrite the search path for the ILP solver used during scheduling).
+        conda_base_path (str):      Path to conda base environment (this can be used to overwrite the search path for conda, mamba and activate).
         log_handler (list):         redirect snakemake output to this list of custom log handler, each a function that takes a log message dictionary (see below) as its only argument (default []). The log message dictionary for the log handler has to following entries:
 
             :level:
@@ -314,14 +364,38 @@ def snakemake(
             default_remote_prefix
         ), "default_remote_prefix needed if tibanna is specified"
         assert tibanna_sfn, "tibanna_sfn needed if tibanna is specified"
+        if tibanna_config:
+            tibanna_config_dict = dict()
+            for cf in tibanna_config:
+                k, v = cf.split("=")
+                if v == "true":
+                    v = True
+                elif v == "false":
+                    v = False
+                elif v.isnumeric():
+                    v = int(v)
+                else:
+                    try:
+                        v = float(v)
+                    except ValueError:
+                        pass
+                tibanna_config_dict.update({k: v})
+            tibanna_config = tibanna_config_dict
+
+    # Google Cloud Life Sciences API uses compute engine and storage
+    if google_lifesciences:
+        assume_shared_fs = False
+        default_remote_provider = "GS"
+        default_remote_prefix = default_remote_prefix.rstrip("/")
+
+    # Currently preemptible instances only supported for Google LifeSciences Executor
+    if preemption_default or preemptible_rules and not google_lifesciences:
+        logger.warning(
+            "Preemptible instances are only available for the Google Life Sciences Executor."
+        )
 
     if updated_files is None:
         updated_files = list()
-
-    if cluster or cluster_sync or drmaa or tibanna:
-        cores = sys.maxsize
-    else:
-        nodes = sys.maxsize
 
     if isinstance(cluster_config, str):
         # Loading configuration from one file is still supported for
@@ -338,14 +412,34 @@ def snakemake(
     else:
         cluster_config_content = dict()
 
-    run_local = not (cluster or cluster_sync or drmaa or kubernetes or tibanna)
-    if run_local and not dryrun:
-        # clean up all previously recorded jobids.
-        shell.cleanup()
+    run_local = not (
+        cluster
+        or cluster_sync
+        or drmaa
+        or kubernetes
+        or tibanna
+        or google_lifesciences
+        or tes
+    )
+    if run_local:
+        if not dryrun:
+            # clean up all previously recorded jobids.
+            shell.cleanup()
+    else:
+        if edit_notebook:
+            raise WorkflowError(
+                "Notebook edit mode is only allowed with local execution."
+            )
+
+    shell.conda_block_conflicting_envvars = not conda_not_block_search_path_envvars
 
     # force thread use for any kind of cluster
     use_threads = (
-        force_use_threads or (os.name != "posix") or cluster or cluster_sync or drmaa
+        force_use_threads
+        or (os.name not in ["posix", "nt"])
+        or cluster
+        or cluster_sync
+        or drmaa
     )
 
     if not keep_logger:
@@ -391,7 +485,8 @@ def snakemake(
     if cluster_mode > 1:
         logger.error("Error: cluster and drmaa args are mutually exclusive")
         return False
-    if debug and (cores > 1 or cluster_mode):
+
+    if debug and (cluster_mode or cores is not None and cores > 1):
         logger.error(
             "Error: debug mode cannot be used with more than one core or cluster execution."
         )
@@ -402,13 +497,13 @@ def snakemake(
         configfiles = []
     for f in configfiles:
         # get values to override. Later configfiles override earlier ones.
-        overwrite_config.update(load_configfile(f))
+        update_config(overwrite_config, load_configfile(f))
     # convert provided paths to absolute paths
     configfiles = list(map(os.path.abspath, configfiles))
 
     # directly specified elements override any configfiles
     if config:
-        overwrite_config.update(config)
+        update_config(overwrite_config, config)
         if config_args is None:
             config_args = unparse_config(config)
 
@@ -451,16 +546,25 @@ def snakemake(
             overwrite_configfiles=configfiles,
             overwrite_clusterconfig=cluster_config_content,
             overwrite_threads=overwrite_threads,
+            max_threads=max_threads,
+            overwrite_scatter=overwrite_scatter,
+            overwrite_groups=overwrite_groups,
+            overwrite_resources=overwrite_resources,
+            group_components=group_components,
             config_args=config_args,
             debug=debug,
             verbose=verbose,
-            use_conda=use_conda or list_conda_envs or cleanup_conda,
+            use_conda=use_conda or list_conda_envs or conda_cleanup_envs,
             use_singularity=use_singularity,
             use_env_modules=use_env_modules,
+            conda_frontend=conda_frontend,
             conda_prefix=conda_prefix,
+            conda_cleanup_pkgs=conda_cleanup_pkgs,
             singularity_prefix=singularity_prefix,
             shadow_prefix=shadow_prefix,
             singularity_args=singularity_args,
+            scheduler_type=scheduler,
+            scheduler_ilp_solver=scheduler_ilp_solver,
             mode=mode,
             wrapper_prefix=wrapper_prefix,
             printshellcmds=printshellcmds,
@@ -474,15 +578,29 @@ def snakemake(
             cores=cores,
             nodes=nodes,
             resources=resources,
+            edit_notebook=edit_notebook,
+            envvars=envvars,
+            max_inventory_wait_time=max_inventory_wait_time,
+            conda_not_block_search_path_envvars=conda_not_block_search_path_envvars,
+            execute_subworkflows=execute_subworkflows,
+            scheduler_solver_path=scheduler_solver_path,
+            conda_base_path=conda_base_path,
+            check_envvars=not lint,  # for linting, we do not need to check whether requested envvars exist
+            all_temp=all_temp,
         )
         success = True
+
         workflow.include(
             snakefile, overwrite_first_rule=True, print_compilation=print_compilation
         )
         workflow.check()
 
         if not print_compilation:
-            if listrules:
+            if lint:
+                success = not workflow.lint(json=lint == "json")
+            elif containerize:
+                workflow.containerize()
+            elif listrules:
                 workflow.list_rules()
             elif list_target_rules:
                 workflow.list_rules(only_targets=True)
@@ -494,7 +612,11 @@ def snakemake(
                 subsnakemake = partial(
                     snakemake,
                     local_cores=local_cores,
+                    max_threads=max_threads,
                     cache=cache,
+                    overwrite_threads=overwrite_threads,
+                    overwrite_scatter=overwrite_scatter,
+                    overwrite_resources=overwrite_resources,
                     default_resources=default_resources,
                     dryrun=dryrun,
                     touch=touch,
@@ -517,7 +639,7 @@ def snakemake(
                     lock=lock,
                     unlock=unlock,
                     cleanup_metadata=cleanup_metadata,
-                    cleanup_conda=cleanup_conda,
+                    conda_cleanup_envs=conda_cleanup_envs,
                     cleanup_shadow=cleanup_shadow,
                     cleanup_scripts=cleanup_scripts,
                     force_incomplete=force_incomplete,
@@ -525,6 +647,7 @@ def snakemake(
                     latency_wait=latency_wait,
                     verbose=verbose,
                     notemp=notemp,
+                    all_temp=all_temp,
                     keep_remote_local=keep_remote_local,
                     nodeps=nodeps,
                     jobscript=jobscript,
@@ -540,28 +663,46 @@ def snakemake(
                     use_singularity=use_singularity,
                     use_env_modules=use_env_modules,
                     conda_prefix=conda_prefix,
+                    conda_cleanup_pkgs=conda_cleanup_pkgs,
+                    conda_frontend=conda_frontend,
                     singularity_prefix=singularity_prefix,
                     shadow_prefix=shadow_prefix,
                     singularity_args=singularity_args,
+                    scheduler=scheduler,
+                    scheduler_ilp_solver=scheduler_ilp_solver,
                     list_conda_envs=list_conda_envs,
                     kubernetes=kubernetes,
-                    kubernetes_envvars=kubernetes_envvars,
                     container_image=container_image,
-                    create_envs_only=create_envs_only,
+                    conda_create_envs_only=conda_create_envs_only,
                     default_remote_provider=default_remote_provider,
                     default_remote_prefix=default_remote_prefix,
                     tibanna=tibanna,
                     tibanna_sfn=tibanna_sfn,
+                    google_lifesciences=google_lifesciences,
+                    google_lifesciences_regions=google_lifesciences_regions,
+                    google_lifesciences_location=google_lifesciences_location,
+                    google_lifesciences_cache=google_lifesciences_cache,
+                    tes=tes,
                     precommand=precommand,
+                    preemption_default=preemption_default,
+                    preemptible_rules=preemptible_rules,
+                    tibanna_config=tibanna_config,
                     assume_shared_fs=assume_shared_fs,
                     cluster_status=cluster_status,
                     max_jobs_per_second=max_jobs_per_second,
                     max_status_checks_per_second=max_status_checks_per_second,
+                    overwrite_groups=overwrite_groups,
+                    group_components=group_components,
+                    max_inventory_wait_time=max_inventory_wait_time,
+                    conda_not_block_search_path_envvars=conda_not_block_search_path_envvars,
                 )
                 success = workflow.execute(
                     targets=targets,
                     dryrun=dryrun,
+                    generate_unit_tests=generate_unit_tests,
                     touch=touch,
+                    scheduler_type=scheduler,
+                    scheduler_ilp_solver=scheduler_ilp_solver,
                     local_cores=local_cores,
                     forcetargets=forcetargets,
                     forceall=forceall,
@@ -582,11 +723,18 @@ def snakemake(
                     drmaa=drmaa,
                     drmaa_log_dir=drmaa_log_dir,
                     kubernetes=kubernetes,
-                    kubernetes_envvars=kubernetes_envvars,
                     container_image=container_image,
                     tibanna=tibanna,
                     tibanna_sfn=tibanna_sfn,
+                    google_lifesciences=google_lifesciences,
+                    google_lifesciences_regions=google_lifesciences_regions,
+                    google_lifesciences_location=google_lifesciences_location,
+                    google_lifesciences_cache=google_lifesciences_cache,
+                    tes=tes,
                     precommand=precommand,
+                    preemption_default=preemption_default,
+                    preemptible_rules=preemptible_rules,
+                    tibanna_config=tibanna_config,
                     max_jobs_per_second=max_jobs_per_second,
                     max_status_checks_per_second=max_status_checks_per_second,
                     printd3dag=printd3dag,
@@ -615,7 +763,7 @@ def snakemake(
                     nodeps=nodeps,
                     keep_target_files=keep_target_files,
                     cleanup_metadata=cleanup_metadata,
-                    cleanup_conda=cleanup_conda,
+                    conda_cleanup_envs=conda_cleanup_envs,
                     cleanup_shadow=cleanup_shadow,
                     cleanup_scripts=cleanup_scripts,
                     subsnakemake=subsnakemake,
@@ -624,13 +772,15 @@ def snakemake(
                     greediness=greediness,
                     no_hooks=no_hooks,
                     force_use_threads=use_threads,
-                    create_envs_only=create_envs_only,
+                    conda_create_envs_only=conda_create_envs_only,
                     assume_shared_fs=assume_shared_fs,
                     cluster_status=cluster_status,
                     report=report,
+                    report_stylesheet=report_stylesheet,
                     export_cwl=export_cwl,
                     batch=batch,
                     keepincomplete=keep_incomplete,
+                    keepmetadata=keep_metadata,
                 )
 
     except BrokenPipeError:
@@ -654,19 +804,61 @@ def snakemake(
 
 
 def parse_set_threads(args):
-    errmsg = "Invalid threads definition: entries have to be defined as RULE=THREADS pairs (with THREADS being a positive integer)."
-    overwrite_threads = dict()
-    if args.set_threads is not None:
-        for entry in args.set_threads:
-            rule, threads = parse_key_value_arg(entry, errmsg=errmsg)
+    return parse_set_ints(
+        args.set_threads,
+        "Invalid threads definition: entries have to be defined as RULE=THREADS pairs "
+        "(with THREADS being a positive integer).",
+    )
+
+
+def parse_set_resources(args):
+    errmsg = (
+        "Invalid resource definition: entries have to be defined as RULE:RESOURCE=VALUE, with "
+        "VALUE being a positive integer or a string."
+    )
+
+    from collections import defaultdict
+
+    assignments = defaultdict(dict)
+    if args.set_resources is not None:
+        for entry in args.set_resources:
+            key, value = parse_key_value_arg(entry, errmsg=errmsg)
+            key = key.split(":")
+            if not len(key) == 2:
+                raise ValueError(errmsg)
+            rule, resource = key
             try:
-                threads = int(threads)
+                value = int(value)
+            except ValueError:
+                assignments[rule][resource] = value
+                continue
+            if value < 0:
+                raise ValueError(errmsg)
+            assignments[rule][resource] = value
+    return assignments
+
+
+def parse_set_scatter(args):
+    return parse_set_ints(
+        args.set_scatter,
+        "Invalid scatter definition: entries have to be defined as NAME=SCATTERITEMS pairs "
+        "(with SCATTERITEMS being a positive integer).",
+    )
+
+
+def parse_set_ints(arg, errmsg):
+    assignments = dict()
+    if arg is not None:
+        for entry in arg:
+            key, value = parse_key_value_arg(entry, errmsg=errmsg)
+            try:
+                value = int(value)
             except ValueError:
                 raise ValueError(errmsg)
-            if threads < 0:
+            if value < 0:
                 raise ValueError(errmsg)
-            overwrite_threads[rule] = threads
-    return overwrite_threads
+            assignments[key] = value
+    return assignments
 
 
 def parse_batch(args):
@@ -685,17 +877,54 @@ def parse_batch(args):
     return None
 
 
+def parse_groups(args):
+    errmsg = "Invalid groups definition: entries have to be defined as RULE=GROUP pairs"
+    overwrite_groups = dict()
+    if args.groups is not None:
+        for entry in args.groups:
+            rule, group = parse_key_value_arg(entry, errmsg=errmsg)
+            overwrite_groups[rule] = group
+    return overwrite_groups
+
+
+def parse_group_components(args):
+    errmsg = "Invalid group components definition: entries have to be defined as GROUP=COMPONENTS pairs (with COMPONENTS being a positive integer)"
+    group_components = dict()
+    if args.group_components is not None:
+        for entry in args.group_components:
+            group, count = parse_key_value_arg(entry, errmsg=errmsg)
+            try:
+                count = int(count)
+            except ValueError:
+                raise ValueError(errmsg)
+            if count <= 0:
+                raise ValueError(errmsg)
+            group_components[group] = count
+    return group_components
+
+
 def parse_key_value_arg(arg, errmsg):
     try:
         key, val = arg.split("=", 1)
     except ValueError:
-        raise ValueError(errmsg)
+        raise ValueError(errmsg + " Unparseable value: %r." % arg)
     return key, val
+
+
+def _bool_parser(value):
+    if value == "True":
+        return True
+    elif value == "False":
+        return False
+    raise ValueError
 
 
 def parse_config(args):
     """Parse config from args."""
-    parsers = [int, float, eval, str]
+    import yaml
+
+    yaml_base_load = lambda s: yaml.load(s, Loader=yaml.loader.BaseLoader)
+    parsers = [int, float, _bool_parser, yaml_base_load, str]
     config = dict()
     if args.config is not None:
         valid = re.compile(r"[a-zA-Z_]\w*$")
@@ -718,7 +947,7 @@ def parse_config(args):
                 except:
                     pass
             assert v is not None
-            config[key] = v
+            update_config(config, {key: v})
     return config
 
 
@@ -734,21 +963,9 @@ def unparse_config(config):
     return items
 
 
-APPDIRS = None
-
-
-def get_appdirs():
-    global APPDIRS
-    if APPDIRS is None:
-        from appdirs import AppDirs
-
-        APPDIRS = AppDirs("snakemake", "snakemake")
-    return APPDIRS
-
-
 def get_profile_file(profile, file, return_default=False):
     dirs = get_appdirs()
-    if os.path.isabs(profile):
+    if os.path.exists(profile):
         search_dirs = [os.path.dirname(profile)]
         profile = os.path.basename(profile)
     else:
@@ -756,7 +973,13 @@ def get_profile_file(profile, file, return_default=False):
     get_path = lambda d: os.path.join(d, profile, file)
     for d in search_dirs:
         p = get_path(d)
-        if os.path.exists(p):
+        # "file" can actually be a full command. If so, `p` won't exist as the
+        # below would check if e.g. '/path/to/profile/script --arg1 val --arg2'
+        # exists. To fix this, we use shlex.split() to get the path to the
+        # script. We check for both, in case the path contains spaces or some
+        # other thing that would cause shlex.split() to mangle the path
+        # inaccurately.
+        if os.path.exists(p) or os.path.exists(shlex.split(p)[0]):
             return p
 
     if return_default:
@@ -793,6 +1016,7 @@ def get_argument_parser(profile=None):
     parser = configargparse.ArgumentParser(
         description="Snakemake is a Python based language and execution "
         "environment for GNU Make-like workflows.",
+        formatter_class=ArgumentDefaultsHelpFormatter,
         default_config_files=config_files,
         config_file_parser_class=YAMLConfigFileParser,
     )
@@ -829,15 +1053,17 @@ def get_argument_parser(profile=None):
                         line options in YAML format. For example,
                         '--cluster qsub' becomes 'cluster: qsub' in the YAML
                         file. Profiles can be obtained from
-                        https://github.com/snakemake-profiles.
+                        https://github.com/snakemake-profiles. 
+                        The profile can also be set via the environment variable $SNAKEMAKE_PROFILE.
                         """.format(
             dirs.site_config_dir, dirs.user_config_dir
         ),
+        env_var="SNAKEMAKE_PROFILE",
     )
 
     group_exec.add_argument(
         "--cache",
-        nargs="+",
+        nargs="*",
         metavar="RULE",
         help="Store output files of given rules in a central cache given by the environment "
         "variable $SNAKEMAKE_OUTPUT_CACHE. Likewise, retrieve output files of the given rules "
@@ -862,16 +1088,29 @@ def get_argument_parser(profile=None):
     )
     group_exec.add_argument(
         "--cores",
-        "--jobs",
-        "-j",
+        "-c",
         action="store",
         const=available_cpu_count(),
         nargs="?",
         metavar="N",
         help=(
-            "Use at most N cores in parallel. "
+            "Use at most N CPU cores/jobs in parallel. "
             "If N is omitted or 'all', the limit is set to the number of "
-            "available cores."
+            "available CPU cores. "
+            "In case of cluster/cloud execution, this argument sets the number of "
+            "total cores used over all jobs (made available to rules via workflow.cores)."
+        ),
+    )
+    group_exec.add_argument(
+        "--jobs",
+        "-j",
+        metavar="N",
+        nargs="?",
+        const=available_cpu_count(),
+        action="store",
+        help=(
+            "Use at most N CPU cluster/cloud jobs in parallel. For local execution this is "
+            "an alias for --cores."
         ),
     )
     group_exec.add_argument(
@@ -881,9 +1120,9 @@ def get_argument_parser(profile=None):
         metavar="N",
         type=int,
         help=(
-            "In cluster mode, use at most N cores of the host machine in parallel "
-            " (default: number of CPU cores of the host). The cores are used to execute "
-            "local rules. This option is ignored when not in cluster mode."
+            "In cluster/cloud mode, use at most N cores of the host machine in parallel "
+            "(default: number of CPU cores of the host). The cores are used to execute "
+            "local rules. This option is ignored when not in cluster/cloud mode."
         ),
     )
     group_exec.add_argument(
@@ -894,20 +1133,45 @@ def get_argument_parser(profile=None):
         help=(
             "Define additional resources that shall constrain the scheduling "
             "analogously to threads (see above). A resource is defined as "
-            "a name and an integer value. E.g. --resources gpu=1. Rules can "
+            "a name and an integer value. E.g. --resources mem_mb=1000. Rules can "
             "use resources by defining the resource keyword, e.g. "
-            "resources: gpu=1. If now two rules require 1 of the resource "
-            "'gpu' they won't be run in parallel by the scheduler."
+            "resources: mem_mb=600. If now two rules require 600 of the resource "
+            "'mem_mb' they won't be run in parallel by the scheduler."
         ),
     )
     group_exec.add_argument(
         "--set-threads",
         metavar="RULE=THREADS",
-        nargs="*",
+        nargs="+",
         help="Overwrite thread usage of rules. This allows to fine-tune workflow "
         "parallelization. In particular, this is helpful to target certain cluster nodes "
         "by e.g. shifting a rule to use more, or less threads than defined in the workflow. "
         "Thereby, THREADS has to be a positive integer, and RULE has to be the name of the rule.",
+    )
+    group_exec.add_argument(
+        "--max-threads",
+        type=int,
+        help="Define a global maximum number of threads for any job. This can be helpful in a cluster/cloud setting, "
+        "when you want to restrict the maximum number of requested threads without modifying the workflow definition "
+        "or overwriting them invidiually with --set-threads.",
+    )
+    group_exec.add_argument(
+        "--set-resources",
+        metavar="RULE:RESOURCE=VALUE",
+        nargs="+",
+        help="Overwrite resource usage of rules. This allows to fine-tune workflow "
+        "resources. In particular, this is helpful to target certain cluster nodes "
+        "by e.g. defining a certain partition for a rule, or overriding a temporary directory. "
+        "Thereby, VALUE has to be a positive integer or a string, RULE has to be the name of the "
+        "rule, and RESOURCE has to be the name of the resource.",
+    )
+    group_exec.add_argument(
+        "--set-scatter",
+        metavar="NAME=SCATTERITEMS",
+        nargs="+",
+        help="Overwrite number of scatter items of scattergather processes. This allows to fine-tune "
+        "workflow parallelization. Thereby, SCATTERITEMS has to be a positive integer, and NAME has to be "
+        "the name of the scattergather process defined via a scattergather directive in the workflow.",
     )
     group_exec.add_argument(
         "--default-resources",
@@ -916,11 +1180,44 @@ def get_argument_parser(profile=None):
         metavar="NAME=INT",
         help=(
             "Define default values of resources for rules that do not define their own values. "
-            "In addition to plain integers, python expressions over inputsize are allowed (e.g. '2*input.size')."
-            "When specifying this without any arguments (--default-resources), it defines 'mem_mb=max(2*input.size, 1000)' "
-            "'disk_mb=max(2*input.size, 1000)', i.e., default disk and mem usage is twice the input file size but at least 1GB."
+            "In addition to plain integers, python expressions over inputsize are allowed (e.g. '2*input.size_mb')."
+            "When specifying this without any arguments (--default-resources), it defines 'mem_mb=max(2*input.size_mb, 1000)' "
+            "'disk_mb=max(2*input.size_mb, 1000)' "
+            "i.e., default disk and mem usage is twice the input file size but at least 1GB."
+            "In addition, the system temporary directory (as given by $TMPDIR, $TEMP, or $TMP) is used for the tmpdir resource. "
+            "The tmpdir resource is automatically used by shell commands, scripts and wrappers to store temporary data (as it is "
+            "mirrored into $TMPDIR, $TEMP, and $TMP for the executed subprocesses). "
+            "If this argument is not specified at all, Snakemake just uses the tmpdir resource as outlined above."
         ),
     )
+
+    group_exec.add_argument(
+        "--preemption-default",
+        type=int,
+        default=None,
+        help=(
+            "A preemptible instance can be requested when using the Google Life Sciences API. If you set a --preemption-default,"
+            "all rules will be subject to the default. Specifically, this integer is the number of restart attempts that will be "
+            "made given that the instance is killed unexpectedly. Note that preemptible instances have a maximum running time of 24 "
+            "hours. If you want to set preemptible instances for only a subset of rules, use --preemptible-rules instead."
+        ),
+    )
+
+    group_exec.add_argument(
+        "--preemptible-rules",
+        nargs="+",
+        default=None,
+        help=(
+            "A preemptible instance can be requested when using the Google Life Sciences API. If you want to use these instances "
+            "for a subset of your rules, you can use --preemptible-rules and then specify a list of rule and integer pairs, where "
+            "each integer indicates the number of restarts to use for the rule's instance in the case that the instance is "
+            "terminated unexpectedly. --preemptible-rules can be used in combination with --preemption-default, and will take "
+            "priority. Note that preemptible instances have a maximum running time of 24. If you want to apply a consistent "
+            "number of retries across all your rules, use --premption-default instead. "
+            "Example: snakemake --preemption-default 10 --preemptible-rules map_reads=3 call_variants=0"
+        ),
+    )
+
     group_exec.add_argument(
         "--config",
         "-C",
@@ -942,8 +1239,16 @@ def get_argument_parser(profile=None):
             "Specify or overwrite the config file of the workflow (see the docs). "
             "Values specified in JSON or YAML format are available in the global config "
             "dictionary inside the workflow. Multiple files overwrite each other in "
-            "the given order."
+            "the given order. Thereby missing keys in previous config files are extended by "
+            "following configfiles. Note that this order also includes a config file defined "
+            "in the workflow definition itself (which will come first)."
         ),
+    )
+    group_exec.add_argument(
+        "--envvars",
+        nargs="+",
+        metavar="VARNAME",
+        help="Environment variables to pass to cloud jobs.",
     )
     group_exec.add_argument(
         "--directory",
@@ -1071,15 +1376,171 @@ def get_argument_parser(profile=None):
         ),
     )
 
-    group_utils = parser.add_argument_group("UTILITIES")
+    try:
+        import pulp
 
-    group_utils.add_argument(
+        lp_solvers = pulp.list_solvers(onlyAvailable=True)
+    except ImportError:
+        # Dummy list for the case that pulp is not available
+        # This only happend when building docs.
+        lp_solvers = ["COIN_CMD"]
+    recommended_lp_solver = "COIN_CMD"
+
+    group_exec.add_argument(
+        "--scheduler",
+        default="greedy" if recommended_lp_solver not in lp_solvers else "ilp",
+        nargs="?",
+        choices=["ilp", "greedy"],
+        help=(
+            "Specifies if jobs are selected by a greedy algorithm or by solving an ilp. "
+            "The ilp scheduler aims to reduce runtime and hdd usage by best possible use of resources."
+        ),
+    )
+    group_exec.add_argument(
+        "--wms-monitor",
+        action="store",
+        nargs="?",
+        help=(
+            "IP and port of workflow management system to monitor the execution of snakemake (e.g. http://127.0.0.1:5000)"
+            " Note that if your service requires an authorization token, you must export WMS_MONITOR_TOKEN in the environment."
+        ),
+    )
+    group_exec.add_argument(
+        "--wms-monitor-arg",
+        nargs="*",
+        metavar="NAME=VALUE",
+        help=(
+            "If the workflow management service accepts extra arguments, provide."
+            " them in key value pairs with --wms-monitor-arg. For example, to run"
+            " an existing workflow using a wms monitor, you can provide the pair "
+            " id=12345 and the arguments will be provided to the endpoint to "
+            " first interact with the workflow"
+        ),
+    )
+    group_exec.add_argument(
+        "--scheduler-ilp-solver",
+        default=recommended_lp_solver,
+        choices=lp_solvers,
+        help=("Specifies solver to be utilized when selecting ilp-scheduler."),
+    )
+    group_exec.add_argument(
+        "--scheduler-solver-path",
+        help="Set the PATH to search for scheduler solver binaries (internal use only).",
+    )
+    group_exec.add_argument(
+        "--conda-base-path",
+        help="Path of conda base installation (home of conda, mamba, activate) (internal use only).",
+    )
+
+    group_exec.add_argument(
+        "--no-subworkflows",
+        "--nosw",
+        action="store_true",
+        help=("Do not evaluate or execute subworkflows."),
+    )
+
+    # TODO add group_partitioning, allowing to define --group rulename=groupname.
+    # i.e. setting groups via the CLI for improving cluster performance given
+    # available resources.
+    # TODO add an additional flag --group-components groupname=3, allowing to set the
+    # number of connected components a group is allowed to span. By default, this is 1
+    # (as now), but the flag allows to extend this. This can be used to run e.g.
+    # 3 jobs of the same rule in the same group, although they are not connected.
+    # Can be helpful for putting together many small jobs or benefitting of shared memory
+    # setups.
+
+    group_group = parser.add_argument_group("GROUPING")
+    group_group.add_argument(
+        "--groups",
+        nargs="+",
+        help="Assign rules to groups (this overwrites any "
+        "group definitions from the workflow).",
+    )
+    group_group.add_argument(
+        "--group-components",
+        nargs="+",
+        help="Set the number of connected components a group is "
+        "allowed to span. By default, this is 1, but this flag "
+        "allows to extend this. This can be used to run e.g. 3 "
+        "jobs of the same rule in the same group, although they "
+        "are not connected. It can be helpful for putting together "
+        "many small jobs or benefitting of shared memory setups.",
+    )
+
+    group_report = parser.add_argument_group("REPORTS")
+
+    group_report.add_argument(
         "--report",
         nargs="?",
         const="report.html",
-        metavar="HTMLFILE",
+        metavar="FILE",
         help="Create an HTML report with results and statistics. "
-        "If no filename is given, report.html is the default.",
+        "This can be either a .html file or a .zip file. "
+        "In the former case, all results are embedded into the .html (this only works for small data). "
+        "In the latter case, results are stored along with a file report.html in the zip archive. "
+        "If no filename is given, an embedded report.html is the default.",
+    )
+    group_report.add_argument(
+        "--report-stylesheet",
+        metavar="CSSFILE",
+        help="Custom stylesheet to use for report. In particular, this can be used for "
+        "branding the report with e.g. a custom logo, see docs.",
+    )
+
+    group_notebooks = parser.add_argument_group("NOTEBOOKS")
+
+    group_notebooks.add_argument(
+        "--draft-notebook",
+        metavar="TARGET",
+        help="Draft a skeleton notebook for the rule used to generate the given target file. This notebook "
+        "can then be opened in a jupyter server, exeucted and implemented until ready. After saving, it "
+        "will automatically be reused in non-interactive mode by Snakemake for subsequent jobs.",
+    )
+    group_notebooks.add_argument(
+        "--edit-notebook",
+        metavar="TARGET",
+        help="Interactively edit the notebook associated with the rule used to generate the given target file. "
+        "This will start a local jupyter notebook server. "
+        "Any changes to the notebook should be saved, and the server has to be stopped by "
+        "closing the notebook and hitting the 'Quit' button on the jupyter dashboard. "
+        "Afterwards, the updated notebook will be automatically stored in the path defined in the rule. "
+        "If the notebook is not yet present, this will create an empty draft. ",
+    )
+    group_notebooks.add_argument(
+        "--notebook-listen",
+        metavar="IP:PORT",
+        default="localhost:8888",
+        help="The IP address and PORT the notebook server used for editing the notebook (--edit-notebook) will listen on.",
+    )
+
+    group_utils = parser.add_argument_group("UTILITIES")
+    group_utils.add_argument(
+        "--lint",
+        nargs="?",
+        const="text",
+        choices=["text", "json"],
+        help="Perform linting on the given workflow. This will print snakemake "
+        "specific suggestions to improve code quality (work in progress, more lints "
+        "to be added in the future). If no argument is provided, plain text output is used.",
+    )
+    group_utils.add_argument(
+        "--generate-unit-tests",
+        nargs="?",
+        const=".tests/unit",
+        metavar="TESTPATH",
+        help="Automatically generate unit tests for each workflow rule. "
+        "This assumes that all input files of each job are already present. "
+        "Rules without a job with present input files will be skipped (a warning will be issued). "
+        "For each rule, one test case will be "
+        "created in the specified test folder (.tests/unit by default). After "
+        "successfull execution, tests can be run with "
+        "'pytest TESTPATH'.",
+    )
+    group_utils.add_argument(
+        "--containerize",
+        action="store_true",
+        help="Print a Dockerfile that provides an execution environment for the workflow, including all "
+        "conda environments.",
     )
     group_utils.add_argument(
         "--export-cwl",
@@ -1104,7 +1565,9 @@ def get_argument_parser(profile=None):
         action="store_true",
         help="Do not execute anything and print the directed "
         "acyclic graph of jobs in the dot language. Recommended "
-        "use on Unix systems: snakemake --dag | dot | display",
+        "use on Unix systems: snakemake --dag | dot | display"
+        "Note print statements in your Snakefile may interfere "
+        "with visualization.",
     )
     group_utils.add_argument(
         "--rulegraph",
@@ -1115,7 +1578,9 @@ def get_argument_parser(profile=None):
         "Note that each rule is displayed once, hence the displayed graph will be "
         "cyclic if a rule appears in several steps of the workflow. "
         "Use this if above option leads to a DAG that is too large. "
-        "Recommended use on Unix systems: snakemake --rulegraph | dot | display",
+        "Recommended use on Unix systems: snakemake --rulegraph | dot | display"
+        "Note print statements in your Snakefile may interfere "
+        "with visualization.",
     )
     group_utils.add_argument(
         "--filegraph",
@@ -1126,7 +1591,9 @@ def get_argument_parser(profile=None):
         "Note that each rule is displayed once, hence the displayed graph will be "
         "cyclic if a rule appears in several steps of the workflow. "
         "Use this if above option leads to a DAG that is too large. "
-        "Recommended use on Unix systems: snakemake --filegraph | dot | display",
+        "Recommended use on Unix systems: snakemake --filegraph | dot | display"
+        "Note print statements in your Snakefile may interfere "
+        "with visualization.",
     )
     group_utils.add_argument(
         "--d3dag",
@@ -1265,6 +1732,13 @@ def get_argument_parser(profile=None):
         action="store_true",
         help="Do not remove incomplete output files by failed jobs.",
     )
+    group_utils.add_argument(
+        "--drop-metadata",
+        action="store_true",
+        help="Drop metadata file tracking information after job finishes. "
+        "Provenance-information based reports (e.g. --report and the "
+        "--list_x_changes functions) will be empty or incomplete.",
+    )
     group_utils.add_argument("--version", "-v", action="version", version=__version__)
 
     group_output = parser.add_argument_group("OUTPUT")
@@ -1351,6 +1825,17 @@ def get_argument_parser(profile=None):
         help="Do not check for incomplete output files.",
     )
     group_behavior.add_argument(
+        "--max-inventory-time",
+        type=int,
+        default=20,
+        metavar="SECONDS",
+        help="Spend at most SECONDS seconds to create a file inventory for the working directory. "
+        "The inventory vastly speeds up file modification and existence checks when computing "
+        "which jobs need to be executed. However, creating the inventory itself can be slow, e.g. on "
+        "network file systems. Hence, we do not spend more than a given amount of time and fall back "
+        "to individual checks for the rest.",
+    )
+    group_behavior.add_argument(
         "--latency-wait",
         "--output-wait",
         "-w",
@@ -1371,12 +1856,26 @@ def get_argument_parser(profile=None):
         "environments.",
     )
     group_behavior.add_argument(
+        "--wait-for-files-file",
+        metavar="FILE",
+        help="Same behaviour as --wait-for-files, but file list is "
+        "stored in file instead of being passed on the commandline. "
+        "This is useful when the list of files is too long to be "
+        "passed on the commandline.",
+    )
+    group_behavior.add_argument(
         "--notemp",
         "--nt",
         action="store_true",
         help="Ignore temp() declarations. This is useful when running only "
         "a part of the workflow, since temp() would lead to deletion of "
         "probably needed files by other parts of the workflow.",
+    )
+    group_behavior.add_argument(
+        "--all-temp",
+        action="store_true",
+        help="Mark all output files as temp files. This can be useful for CI testing, "
+        "in order to save space.",
     )
     group_behavior.add_argument(
         "--keep-remote",
@@ -1410,6 +1909,7 @@ def get_argument_parser(profile=None):
         "fractions allowed.",
     )
     group_behavior.add_argument(
+        "-T",
         "--restart-times",
         default=0,
         type=int,
@@ -1432,7 +1932,18 @@ def get_argument_parser(profile=None):
     )
     group_behavior.add_argument(
         "--default-remote-provider",
-        choices=["S3", "GS", "FTP", "SFTP", "S3Mocked", "gfal", "gridftp", "iRODS"],
+        choices=[
+            "S3",
+            "GS",
+            "FTP",
+            "SFTP",
+            "S3Mocked",
+            "gfal",
+            "gridftp",
+            "iRODS",
+            "AzBlob",
+            "XRootD",
+        ],
         help="Specify default remote provider to be used for "
         "all input and output files that don't yet specify "
         "one.",
@@ -1510,14 +2021,13 @@ def get_argument_parser(profile=None):
         "Snakemake will call this function for every logging output (given as a dictionary msg)"
         "allowing to e.g. send notifications in the form of e.g. slack messages or emails.",
     )
-
     group_behavior.add_argument(
         "--log-service",
         default=None,
-        choices=["none", "slack"],
+        choices=["none", "slack", "wms"],
         help="Set a specific messaging service for logging output."
         "Snakemake will notify the service on errors and completed execution."
-        "Currently only slack is supported.",
+        "Currently slack and workflow management system (wms) are supported.",
     )
 
     group_cluster = parser.add_argument_group("CLUSTER")
@@ -1526,7 +2036,6 @@ def get_argument_parser(profile=None):
     cluster_mode_group = group_cluster.add_mutually_exclusive_group()
     cluster_mode_group.add_argument(
         "--cluster",
-        "-c",
         metavar="CMD",
         help=(
             "Execute snakemake rules with the given submit command, "
@@ -1634,6 +2143,8 @@ def get_argument_parser(profile=None):
     group_cloud = parser.add_argument_group("CLOUD")
     group_kubernetes = parser.add_argument_group("KUBERNETES")
     group_tibanna = parser.add_argument_group("TIBANNA")
+    group_google_life_science = parser.add_argument_group("GOOGLE_LIFE_SCIENCE")
+    group_tes = parser.add_argument_group("TES")
 
     group_kubernetes.add_argument(
         "--kubernetes",
@@ -1649,23 +2160,17 @@ def get_argument_parser(profile=None):
         "integration via --use-conda.",
     )
     group_kubernetes.add_argument(
-        "--kubernetes-env",
-        nargs="+",
-        metavar="ENVVAR",
-        default=[],
-        help="Specify environment variables to pass to the kubernetes job.",
-    )
-    group_kubernetes.add_argument(
         "--container-image",
         metavar="IMAGE",
-        help="Docker image to use, e.g., when submitting jobs to kubernetes. "
-        "By default, this is 'https://hub.docker.com/r/snakemake/snakemake', tagged with "
+        help="Docker image to use, e.g., when submitting jobs to kubernetes "
+        "Defaults to 'https://hub.docker.com/r/snakemake/snakemake', tagged with "
         "the same version as the currently running Snakemake instance. "
         "Note that overwriting this value is up to your responsibility. "
         "Any used image has to contain a working snakemake installation "
         "that is compatible with (or ideally the same as) the currently "
         "running version.",
     )
+
     group_tibanna.add_argument(
         "--tibanna",
         action="store_true",
@@ -1694,6 +2199,52 @@ def get_argument_parser(profile=None):
         " between S3 bucket and the run environment (container) is automatically"
         " handled by Tibanna.",
     )
+    group_tibanna.add_argument(
+        "--tibanna-config",
+        nargs="+",
+        help="Additional tibanna config e.g. --tibanna-config spot_instance=true subnet="
+        "<subnet_id> security group=<security_group_id>",
+    )
+    group_google_life_science.add_argument(
+        "--google-lifesciences",
+        action="store_true",
+        help="Execute workflow on Google Cloud cloud using the Google Life. "
+        " Science API. This requires default application credentials (json) "
+        " to be created and export to the environment to use Google Cloud "
+        " Storage, Compute Engine, and Life Sciences. The credential file "
+        " should be exported as GOOGLE_APPLICATION_CREDENTIALS for snakemake "
+        " to discover. Also, --use-conda, --use-singularity, --config, "
+        "--configfile are supported and will be carried over.",
+    )
+    group_google_life_science.add_argument(
+        "--google-lifesciences-regions",
+        nargs="+",
+        default=["us-east1", "us-west1", "us-central1"],
+        help="Specify one or more valid instance regions (defaults to US)",
+    )
+    group_google_life_science.add_argument(
+        "--google-lifesciences-location",
+        help="The Life Sciences API service used to schedule the jobs. "
+        " E.g., us-centra1 (Iowa) and europe-west2 (London) "
+        " Watch the terminal output to see all options found to be available. "
+        " If not specified, defaults to the first found with a matching prefix "
+        " from regions specified with --google-lifesciences-regions.",
+    )
+    group_google_life_science.add_argument(
+        "--google-lifesciences-keep-cache",
+        action="store_true",
+        help="Cache workflows in your Google Cloud Storage Bucket specified "
+        "by --default-remote-prefix/{source}/{cache}. Each workflow working "
+        "directory is compressed to a .tar.gz, named by the hash of the "
+        "contents, and kept in Google Cloud Storage. By default, the caches "
+        "are deleted at the shutdown step of the workflow.",
+    )
+
+    group_tes.add_argument(
+        "--tes",
+        metavar="URL",
+        help="Send workflow tasks to GA4GH TES server specified by url.",
+    )
 
     group_conda = parser.add_argument_group("CONDA")
 
@@ -1704,32 +2255,61 @@ def get_argument_parser(profile=None):
         "If this flag is not set, the conda directive is ignored.",
     )
     group_conda.add_argument(
+        "--conda-not-block-search-path-envvars",
+        action="store_true",
+        help="Do not block environment variables that modify the search path "
+        "(R_LIBS, PYTHONPATH, PERL5LIB, PERLLIB) when using conda environments.",
+    )
+    group_conda.add_argument(
         "--list-conda-envs",
         action="store_true",
         help="List all conda environments and their location on " "disk.",
     )
     group_conda.add_argument(
-        "--cleanup-conda",
-        action="store_true",
-        help="Cleanup unused conda environments.",
-    )
-    group_conda.add_argument(
         "--conda-prefix",
         metavar="DIR",
+        default=os.environ.get("SNAKEMAKE_CONDA_PREFIX", None),
         help="Specify a directory in which the 'conda' and 'conda-archive' "
         "directories are created. These are used to store conda environments "
         "and their archives, respectively. If not supplied, the value is set "
         "to the '.snakemake' directory relative to the invocation directory. "
         "If supplied, the `--use-conda` flag must also be set. The value may "
         "be given as a relative path, which will be extrapolated to the "
-        "invocation directory, or as an absolute path.",
+        "invocation directory, or as an absolute path. The value can also be "
+        "provided via the environment variable $SNAKEMAKE_CONDA_PREFIX.",
     )
     group_conda.add_argument(
-        "--create-envs-only",
+        "--conda-cleanup-envs",
+        action="store_true",
+        help="Cleanup unused conda environments.",
+    )
+
+    from snakemake.deployment.conda import CondaCleanupMode
+
+    group_conda.add_argument(
+        "--conda-cleanup-pkgs",
+        type=CondaCleanupMode,
+        const=CondaCleanupMode.tarballs,
+        choices=list(CondaCleanupMode),
+        nargs="?",
+        help="Cleanup conda packages after creating environments. "
+        "In case of 'tarballs' mode, will clean up all downloaded package tarballs. "
+        "In case of 'cache' mode, will additionally clean up unused package caches. "
+        "If mode is omitted, will default to only cleaning up the tarballs.",
+    )
+    group_conda.add_argument(
+        "--conda-create-envs-only",
         action="store_true",
         help="If specified, only creates the job-specific "
         "conda environments then exits. The `--use-conda` "
         "flag must also be set.",
+    )
+    group_conda.add_argument(
+        "--conda-frontend",
+        default="mamba",
+        choices=["conda", "mamba"],
+        help="Choose the conda frontend for installing environments. "
+        "Mamba is much faster and highly recommended.",
     )
 
     group_singularity = parser.add_argument_group("SINGULARITY")
@@ -1771,8 +2351,29 @@ def get_argument_parser(profile=None):
     return parser
 
 
+def generate_parser_metadata(parser, args):
+    """Given a populated parser, generate the original command along with
+    metadata that can be handed to a logger to use as needed.
+    """
+    command = "snakemake %s" % " ".join(
+        parser._source_to_settings["command_line"][""][1]
+    )
+    workdir = os.getcwd()
+    metadata = args.__dict__
+    metadata.update({"command": command})
+    return metadata
+
+
 def main(argv=None):
     """Main entry point."""
+
+    if sys.version_info < MIN_PY_VERSION:
+        print(
+            "Snakemake requires at least Python {}.".format(MIN_PY_VERSION),
+            file=sys.stderr,
+        )
+        exit(1)
+
     parser = get_argument_parser()
     args = parser.parse_args(argv)
 
@@ -1793,10 +2394,17 @@ def main(argv=None):
             args.jobscript = adjust_path(args.jobscript)
         if args.cluster:
             args.cluster = adjust_path(args.cluster)
+        if args.cluster_config:
+            if isinstance(args.cluster_config, list):
+                args.cluster_config = [adjust_path(cfg) for cfg in args.cluster_config]
+            else:
+                args.cluster_config = adjust_path(args.cluster_config)
         if args.cluster_sync:
             args.cluster_sync = adjust_path(args.cluster_sync)
         if args.cluster_status:
             args.cluster_status = adjust_path(args.cluster_status)
+        if args.report_stylesheet:
+            args.report_stylesheet = adjust_path(args.report_stylesheet)
 
     if args.bash_completion:
         cmd = b"complete -o bashdefault -C snakemake-bash-completion snakemake"
@@ -1812,47 +2420,115 @@ def main(argv=None):
     try:
         resources = parse_resources(args.resources)
         config = parse_config(args)
-        if (args.default_resources is not None and not args.default_resources) or (
-            args.tibanna and not args.default_resources
-        ):
-            args.default_resources = [
-                "mem_mb=max(2*input.size, 1000)",
-                "disk_mb=max(2*input.size, 1000)",
-            ]
-        default_resources = DefaultResources(args.default_resources)
+
+        if args.default_resources is not None:
+            default_resources = DefaultResources(args.default_resources)
+        else:
+            default_resources = None
+
         batch = parse_batch(args)
         overwrite_threads = parse_set_threads(args)
+        overwrite_resources = parse_set_resources(args)
+
+        overwrite_scatter = parse_set_scatter(args)
+
+        overwrite_groups = parse_groups(args)
+        group_components = parse_group_components(args)
     except ValueError as e:
         print(e, file=sys.stderr)
         print("", file=sys.stderr)
         sys.exit(1)
 
-    if args.cores is not None:
-        if args.cores == "all":
-            args.cores = available_cpu_count()
+    non_local_exec = (
+        args.cluster
+        or args.cluster_sync
+        or args.tibanna
+        or args.kubernetes
+        or args.tes
+        or args.google_lifesciences
+        or args.drmaa
+    )
+    no_exec = (
+        args.print_compilation
+        or args.list_code_changes
+        or args.list_conda_envs
+        or args.list_input_changes
+        or args.list_params_changes
+        or args.list
+        or args.list_target_rules
+        or args.list_untracked
+        or args.list_version_changes
+        or args.export_cwl
+        or args.generate_unit_tests
+        or args.dag
+        or args.d3dag
+        or args.filegraph
+        or args.rulegraph
+        or args.summary
+        or args.lint
+        or args.containerize
+        or args.report
+        or args.gui
+        or args.archive
+        or args.unlock
+    )
+    local_exec = not (no_exec or non_local_exec)
+
+    def parse_cores(cores):
+        if cores == "all":
+            return available_cpu_count()
         else:
             try:
-                args.cores = int(args.cores)
+                return int(cores)
             except ValueError:
                 print(
-                    "Error parsing number of cores (--cores, --jobs, -j): must be integer, empty, or 'all'.",
+                    "Error parsing number of cores (--cores, -c, -j): must be integer, empty, or 'all'.",
                     file=sys.stderr,
                 )
                 sys.exit(1)
-    if args.cluster or args.cluster_sync or args.drmaa:
-        if args.cores is None:
-            if args.dryrun:
+
+    if args.cores is not None:
+        args.cores = parse_cores(args.cores)
+        if local_exec:
+            # avoid people accidentally setting jobs as well
+            args.jobs = None
+    else:
+        if no_exec:
+            args.cores = 1
+        elif local_exec:
+            if args.jobs is not None:
+                args.cores = parse_cores(args.jobs)
+                args.jobs = None
+            elif args.dryrun:
+                # dryrun with single core if nothing specified
                 args.cores = 1
             else:
                 print(
-                    "Error: you need to specify the maximum number of jobs to "
-                    "be queued or executed at the same time with --jobs.",
+                    "Error: you need to specify the maximum number of CPU cores to "
+                    "be used at the same time. If you want to use N cores, say --cores N or "
+                    "-cN. For all cores on your system (be sure that this is appropriate) "
+                    "use --cores all. For no parallelization use --cores 1 or -c1.",
                     file=sys.stderr,
                 )
                 sys.exit(1)
-    elif args.cores is None:
-        # if nothing specified, use all avaiable cores
-        args.cores = available_cpu_count()
+
+    if non_local_exec:
+        if args.jobs is None:
+            print(
+                "Error: you need to specify the maximum number of jobs to "
+                "be queued or executed at the same time with --jobs or -j.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        else:
+            try:
+                args.jobs = int(args.jobs)
+            except ValueError:
+                print(
+                    "Error parsing number of jobs (--jobs, -j): must be integer.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
 
     if args.drmaa_log_dir is not None:
         if not os.path.isabs(args.drmaa_log_dir):
@@ -1871,13 +2547,29 @@ def main(argv=None):
         )
         sys.exit(1)
 
-    if (args.conda_prefix or args.create_envs_only) and not args.use_conda:
+    if (args.conda_prefix or args.conda_create_envs_only) and not args.use_conda:
         print(
             "Error: --use-conda must be set if --conda-prefix or "
             "--create-envs-only is set.",
             file=sys.stderr,
         )
         sys.exit(1)
+
+    if args.use_conda and args.conda_frontend == "mamba":
+        from snakemake.deployment.conda import is_mamba_available
+
+        if not is_mamba_available():
+            print(
+                "Error: mamba package manager is not available. "
+                "The mamba package manager (https://github.com/mamba-org/mamba) is an "
+                "extremely fast and robust conda replacement. "
+                "It is the recommended way of using Snakemake's conda integration. "
+                "It can be installed with `conda install -n base -c conda-forge mamba`. "
+                "If you still prefer to use conda, you can enforce that by setting "
+                "`--conda-frontend conda`.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     if args.singularity_prefix and not args.use_singularity:
         print(
@@ -1892,7 +2584,7 @@ def main(argv=None):
         print(
             "Error: --kubernetes must be combined with "
             "--default-remote-provider and --default-remote-prefix, see "
-            "https://snakemake.readthedocs.io/en/stable/executable.html"
+            "https://snakemake.readthedocs.io/en/stable/executing/cloud.html"
             "#executing-a-snakemake-workflow-via-kubernetes",
             file=sys.stderr,
         )
@@ -1921,6 +2613,24 @@ def main(argv=None):
                     file=sys.stderr,
                 )
                 sys.exit(1)
+
+    if args.google_lifesciences:
+        if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+            print(
+                "Error: GOOGLE_APPLICATION_CREDENTIALS environment variable must "
+                "be available for --google-lifesciences",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        if not args.default_remote_prefix:
+            print(
+                "Error: --google-life-sciences must be combined with "
+                " --default-remote-prefix to provide bucket name and "
+                "subdirectory (prefix) (e.g. 'bucketname/projectname'",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     if args.delete_all_output and args.delete_temp_output:
         print(
@@ -2010,19 +2720,58 @@ def main(argv=None):
             slack_logger = logging.SlackLogger()
             log_handler.append(slack_logger.log_handler)
 
+        elif args.wms_monitor or args.log_service == "wms":
+            # Generate additional metadata for server
+            metadata = generate_parser_metadata(parser, args)
+            wms_logger = logging.WMSLogger(
+                args.wms_monitor, args.wms_monitor_arg, metadata=metadata
+            )
+            log_handler.append(wms_logger.log_handler)
+
+        if args.draft_notebook:
+            from snakemake import notebook
+
+            args.target = [args.draft_notebook]
+            args.edit_notebook = notebook.EditMode(draft_only=True)
+        elif args.edit_notebook:
+            from snakemake import notebook
+
+            args.target = [args.edit_notebook]
+            args.force = True
+            args.edit_notebook = notebook.EditMode(args.notebook_listen)
+
+        aggregated_wait_for_files = args.wait_for_files
+        if args.wait_for_files_file is not None:
+            wait_for_files([args.wait_for_files_file], latency_wait=args.latency_wait)
+
+            with open(args.wait_for_files_file) as fd:
+                extra_wait_files = [line.strip() for line in fd.readlines()]
+
+            if aggregated_wait_for_files is None:
+                aggregated_wait_for_files = extra_wait_files
+            else:
+                aggregated_wait_for_files.extend(extra_wait_files)
+
         success = snakemake(
             args.snakefile,
             batch=batch,
             cache=args.cache,
             report=args.report,
+            report_stylesheet=args.report_stylesheet,
+            lint=args.lint,
+            containerize=args.containerize,
+            generate_unit_tests=args.generate_unit_tests,
             listrules=args.list,
             list_target_rules=args.list_target_rules,
             cores=args.cores,
             local_cores=args.local_cores,
-            nodes=args.cores,
+            nodes=args.jobs,
             resources=resources,
             overwrite_threads=overwrite_threads,
+            max_threads=args.max_threads,
+            overwrite_scatter=overwrite_scatter,
             default_resources=default_resources,
+            overwrite_resources=overwrite_resources,
             config=config,
             configfiles=args.configfile,
             config_args=args.config,
@@ -2053,11 +2802,18 @@ def main(argv=None):
             drmaa=args.drmaa,
             drmaa_log_dir=args.drmaa_log_dir,
             kubernetes=args.kubernetes,
-            kubernetes_envvars=args.kubernetes_env,
             container_image=args.container_image,
             tibanna=args.tibanna,
             tibanna_sfn=args.tibanna_sfn,
+            google_lifesciences=args.google_lifesciences,
+            google_lifesciences_regions=args.google_lifesciences_regions,
+            google_lifesciences_location=args.google_lifesciences_location,
+            google_lifesciences_cache=args.google_lifesciences_keep_cache,
+            tes=args.tes,
             precommand=args.precommand,
+            preemption_default=args.preemption_default,
+            preemptible_rules=args.preemptible_rules,
+            tibanna_config=args.tibanna_config,
             jobname=args.jobname,
             immediate_submit=args.immediate_submit,
             standalone=True,
@@ -2065,7 +2821,7 @@ def main(argv=None):
             lock=not args.nolock,
             unlock=args.unlock,
             cleanup_metadata=args.cleanup_metadata,
-            cleanup_conda=args.cleanup_conda,
+            conda_cleanup_envs=args.conda_cleanup_envs,
             cleanup_shadow=args.cleanup_shadow,
             cleanup_scripts=not args.skip_script_cleanup,
             force_incomplete=args.rerun_incomplete,
@@ -2085,12 +2841,13 @@ def main(argv=None):
             debug=args.debug,
             jobscript=args.jobscript,
             notemp=args.notemp,
+            all_temp=args.all_temp,
             keep_remote_local=args.keep_remote,
             greediness=args.greediness,
             no_hooks=args.no_hooks,
             overwrite_shellcmd=args.overwrite_shellcmd,
             latency_wait=args.latency_wait,
-            wait_for_files=args.wait_for_files,
+            wait_for_files=aggregated_wait_for_files,
             keep_target_files=args.keep_target_files,
             allowed_rules=args.allowed_rules,
             max_jobs_per_second=args.max_jobs_per_second,
@@ -2099,14 +2856,18 @@ def main(argv=None):
             attempt=args.attempt,
             force_use_threads=args.force_use_threads,
             use_conda=args.use_conda,
+            conda_frontend=args.conda_frontend,
             conda_prefix=args.conda_prefix,
+            conda_cleanup_pkgs=args.conda_cleanup_pkgs,
             list_conda_envs=args.list_conda_envs,
             use_singularity=args.use_singularity,
             use_env_modules=args.use_envmodules,
             singularity_prefix=args.singularity_prefix,
             shadow_prefix=args.shadow_prefix,
             singularity_args=args.singularity_args,
-            create_envs_only=args.create_envs_only,
+            scheduler=args.scheduler,
+            scheduler_ilp_solver=args.scheduler_ilp_solver,
+            conda_create_envs_only=args.conda_create_envs_only,
             mode=args.mode,
             wrapper_prefix=args.wrapper_prefix,
             default_remote_provider=args.default_remote_provider,
@@ -2116,14 +2877,33 @@ def main(argv=None):
             export_cwl=args.export_cwl,
             show_failed_logs=args.show_failed_logs,
             keep_incomplete=args.keep_incomplete,
+            keep_metadata=not args.drop_metadata,
+            edit_notebook=args.edit_notebook,
+            envvars=args.envvars,
+            overwrite_groups=overwrite_groups,
+            group_components=group_components,
+            max_inventory_wait_time=args.max_inventory_time,
             log_handler=log_handler,
+            execute_subworkflows=not args.no_subworkflows,
+            conda_not_block_search_path_envvars=args.conda_not_block_search_path_envvars,
+            scheduler_solver_path=args.scheduler_solver_path,
+            conda_base_path=args.conda_base_path,
         )
 
     if args.runtime_profile:
         with open(args.runtime_profile, "w") as out:
             profile = yappi.get_func_stats()
             profile.sort("totaltime")
-            profile.print_all(out=out)
+            profile.print_all(
+                out=out,
+                columns={
+                    0: ("name", 120),
+                    1: ("ncall", 10),
+                    2: ("tsub", 8),
+                    3: ("ttot", 8),
+                    4: ("tavg", 8),
+                },
+            )
 
     sys.exit(0 if success else 1)
 

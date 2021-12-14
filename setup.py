@@ -4,7 +4,7 @@ from __future__ import print_function
 
 __author__ = "Johannes Köster"
 __copyright__ = "Copyright 2015, Johannes Köster"
-__email__ = "koester@jimmy.harvard.edu"
+__email__ = "johannes.koester@uni-due.de"
 __license__ = "MIT"
 
 import sys
@@ -12,7 +12,7 @@ import versioneer
 
 
 if sys.version_info < (3, 5):
-    print("At least Python 3.5 is required.\n", file=sys.stderr)
+    print("At least Python 3.5 is required for Snakemake.\n", file=sys.stderr)
     exit(1)
 
 
@@ -37,14 +37,25 @@ setup(
     zip_safe=False,
     license="MIT",
     url="https://snakemake.readthedocs.io",
-    packages=["snakemake", "snakemake.remote", "snakemake.report", "snakemake.caching", "snakemake.deployment"],
+    packages=[
+        "snakemake",
+        "snakemake.remote",
+        "snakemake.report",
+        "snakemake.common",
+        "snakemake.caching",
+        "snakemake.deployment",
+        "snakemake.linting",
+        "snakemake.executors",
+        "snakemake.unit_tests",
+        "snakemake.unit_tests.templates"
+    ],
     entry_points={
         "console_scripts": [
             "snakemake = snakemake:main",
             "snakemake-bash-completion = snakemake:bash_completion",
         ]
     },
-    package_data={"": ["*.css", "*.sh", "*.html"]},
+    package_data={"": ["*.css", "*.sh", "*.html", "*.jinja2"]},
     install_requires=[
         "wrapt",
         "requests",
@@ -59,8 +70,27 @@ setup(
         "psutil",
         "nbformat",
         "toposort",
+        "connection_pool >=0.0.3",
+        "pulp >=2.0",
+        "smart_open >=3.0",
+        "filelock",
+        "stopit",
+        "tabulate",
     ],
-    extras_require={"reports": ["jinja2", "networkx", "pygments", "pygraphviz"], "messaging": ["slacker"]},
+    extras_require={
+        "reports": ["jinja2", "networkx", "pygments", "pygraphviz"],
+        "messaging": ["slacker"],
+        "google-cloud": [
+            "oauth2client",
+            "google-crc32c",
+            "google-api-python-client",
+            "google-cloud-storage",
+        ],
+        "pep": [
+            "peppy",
+            "eido",
+        ]
+    },
     classifiers=[
         "Development Status :: 5 - Production/Stable",
         "Environment :: Console",
